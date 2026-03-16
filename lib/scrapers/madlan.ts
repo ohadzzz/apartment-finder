@@ -1,225 +1,172 @@
 import * as cheerio from "cheerio";
 import { Listing, SearchPreferences } from "../types";
 
-const MADLAN_GQL_URL = "https://www.madlan.co.il/api2";
-
-function buildMadlanQuery(prefs: SearchPreferences) {
-  return {
-    operationName: "SearchResultsQuery",
-    variables: {
-      filterBy: {
-        dealType: "rent",
-        city: "תל אביב יפו",
-        minPrice: prefs.minPrice || undefined,
-        maxPrice: prefs.maxPrice || undefined,
-        minRooms: prefs.minRooms || undefined,
-        maxRooms: prefs.maxRooms || undefined,
-        minArea: prefs.minSqm || undefined,
-        maxArea: prefs.maxSqm || undefined,
-        hasParking: prefs.parking || undefined,
-        hasMamad: prefs.mamad || undefined,
-        hasBalcony: prefs.balcony || undefined,
-        hasElevator: prefs.elevator || undefined,
-        propertyTypes: prefs.penthouse
-          ? ["apartment", "penthouse"]
-          : ["apartment"],
-      },
-      sort: "date",
-      page: 1,
-    },
-    query: `
-      query SearchResultsQuery($filterBy: SearchFilterInput!, $sort: String, $page: Int) {
-        searchResults(filterBy: $filterBy, sort: $sort, page: $page) {
-          items {
-            id
-            address
-            neighborhood
-            price
-            rooms
-            area
-            floor
-            description
-            images
-            balcony
-            parking
-            mamad
-            elevator
-            condition
-            dateAdded
-            contactName
-            contactPhone
-            url
-          }
-          totalCount
-        }
-      }
-    `,
-  };
-}
+/**
+ * Madlan scraper.
+ * Madlan (owned by Yad2) uses a complex GraphQL API (api3) that requires
+ * session cookies and custom predicate-based queries. We attempt to fetch
+ * the SSR HTML and extract embedded data from __SSR_HYDRATED_CONTEXT__.
+ *
+ * Note: Most Madlan rental listings overlap with Yad2 since they're the same company.
+ */
 
 export async function searchMadlan(prefs: SearchPreferences): Promise<Listing[]> {
-  // Try GraphQL API first
-  try {
-    const listings = await searchMadlanApi(prefs);
-    if (listings.length > 0) return listings;
-  } catch (error) {
-    console.error("Madlan API failed:", error);
-  }
-
-  // Fall back to HTML scraping
-  return scrapeMadlanHtml(prefs);
-}
-
-async function searchMadlanApi(prefs: SearchPreferences): Promise<Listing[]> {
-  const query = buildMadlanQuery(prefs);
-
-  const response = await fetch(MADLAN_GQL_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent":
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-      Accept: "application/json",
-      Referer: "https://www.madlan.co.il/",
-      Origin: "https://www.madlan.co.il",
-    },
-    body: JSON.stringify(query),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Madlan API: ${response.status}`);
-  }
-
-  const data = await response.json();
-  const items = data?.data?.searchResults?.items || [];
-
-  return items.map((item: any) => ({
-    id: `madlan_${item.id}`,
-    source: "madlan" as const,
-    title: item.address || "",
-    description: item.description || "",
-    price: item.price || 0,
-    rooms: item.rooms || 0,
-    sqm: item.area || 0,
-    floor: item.floor || 0,
-    area: item.neighborhood || "",
-    address: item.address || "",
-    balcony: Boolean(item.balcony),
-    parking: Boolean(item.parking),
-    mamad: Boolean(item.mamad),
-    elevator: Boolean(item.elevator),
-    condition: item.condition || "",
-    images: item.images || [],
-    url: item.url
-      ? `https://www.madlan.co.il${item.url}`
-      : "https://www.madlan.co.il/",
-    agentName: item.contactName,
-    agentPhone: item.contactPhone,
-    postedAt: item.dateAdded || new Date().toISOString(),
-    scrapedAt: new Date().toISOString(),
-  }));
-}
-
-async function scrapeMadlanHtml(prefs: SearchPreferences): Promise<Listing[]> {
-  // Build URL with search params
-  const params = new URLSearchParams();
-  params.set("dealType", "rent");
-  params.set("city", "תל אביב יפו");
-  if (prefs.minPrice) params.set("minPrice", String(prefs.minPrice));
-  if (prefs.maxPrice) params.set("maxPrice", String(prefs.maxPrice));
-  if (prefs.minRooms) params.set("minRooms", String(prefs.minRooms));
-  if (prefs.maxRooms) params.set("maxRooms", String(prefs.maxRooms));
-
-  const url = `https://www.madlan.co.il/rent/תל-אביב-יפו?${params.toString()}`;
+  const url = buildMadlanUrl(prefs);
+  console.log("[Madlan] Fetching:", url);
 
   try {
     const response = await fetch(url, {
       headers: {
         "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8",
+          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
       },
     });
 
-    const html = await response.text();
-    const $ = cheerio.load(html);
-    const listings: Listing[] = [];
-
-    // Madlan renders with React - try to find __NEXT_DATA__ or embedded JSON
-    const nextDataScript = $("#__NEXT_DATA__").html();
-    if (nextDataScript) {
-      try {
-        const nextData = JSON.parse(nextDataScript);
-        const results =
-          nextData?.props?.pageProps?.searchResults?.items ||
-          nextData?.props?.pageProps?.dehydratedState?.queries?.[0]?.state?.data?.items ||
-          [];
-
-        for (const item of results) {
-          listings.push({
-            id: `madlan_${item.id || item.docId || Date.now()}_${listings.length}`,
-            source: "madlan",
-            title: item.address || item.street || "",
-            description: item.description || "",
-            price: item.price || 0,
-            rooms: item.rooms || 0,
-            sqm: item.area || item.squareMeters || 0,
-            floor: item.floor || 0,
-            area: item.neighborhood || item.area_name || "",
-            address: item.address || "",
-            balcony: Boolean(item.balcony),
-            parking: Boolean(item.parking),
-            mamad: Boolean(item.mamad),
-            elevator: Boolean(item.elevator),
-            condition: item.condition || "",
-            images: item.images || [],
-            url: `https://www.madlan.co.il/listing/${item.id || item.docId || ""}`,
-            postedAt: item.dateAdded || new Date().toISOString(),
-            scrapedAt: new Date().toISOString(),
-          });
-        }
-      } catch (e) {
-        console.error("Failed to parse Madlan __NEXT_DATA__:", e);
-      }
+    if (!response.ok) {
+      console.error(`[Madlan] HTTP ${response.status}`);
+      return [];
     }
 
-    // Also try scraping visible HTML elements
-    $("[class*='listing'], [class*='card'], [data-testid*='listing']").each(
-      (i, el) => {
-        const $el = $(el);
-        const title = $el.find("[class*='address'], [class*='title']").first().text().trim();
-        const price = $el.find("[class*='price']").first().text().trim();
-        const link = $el.find("a").first().attr("href") || "";
-
-        if (title && price) {
-          listings.push({
-            id: `madlan_html_${Date.now()}_${i}`,
-            source: "madlan",
-            title,
-            description: "",
-            price: parseInt(price.replace(/[^\d]/g, "")) || 0,
-            rooms: 0,
-            sqm: 0,
-            floor: 0,
-            area: "",
-            address: title,
-            balcony: false,
-            parking: false,
-            mamad: false,
-            elevator: false,
-            condition: "",
-            images: [],
-            url: link.startsWith("http") ? link : `https://www.madlan.co.il${link}`,
-            postedAt: new Date().toISOString(),
-            scrapedAt: new Date().toISOString(),
-          });
-        }
-      },
-    );
-
-    return listings;
+    const html = await response.text();
+    return parseMadlanHtml(html);
   } catch (error) {
-    console.error("Madlan HTML scrape failed:", error);
+    console.error("[Madlan] Fetch failed:", error);
     return [];
+  }
+}
+
+function buildMadlanUrl(prefs: SearchPreferences): string {
+  // Madlan uses path-based routing: /for-rent/תל-אביב-יפו
+  // Filters are applied via query params
+  const params = new URLSearchParams();
+  if (prefs.minPrice) params.set("minPrice", String(prefs.minPrice));
+  if (prefs.maxPrice) params.set("maxPrice", String(prefs.maxPrice));
+  if (prefs.minRooms) params.set("minRooms", String(prefs.minRooms));
+  if (prefs.maxRooms) params.set("maxRooms", String(prefs.maxRooms));
+
+  const base = "https://www.madlan.co.il/for-rent/%D7%AA%D7%9C-%D7%90%D7%91%D7%99%D7%91-%D7%99%D7%A4%D7%95";
+  const qs = params.toString();
+  return qs ? `${base}?${qs}` : base;
+}
+
+function parseMadlanHtml(html: string): Listing[] {
+  const listings: Listing[] = [];
+
+  // Try to extract data from __SSR_HYDRATED_CONTEXT__ script
+  const ssrMatch = html.match(/window\.__SSR_HYDRATED_CONTEXT__\s*=\s*(\{[\s\S]+?\});\s*<\/script>/);
+  if (ssrMatch) {
+    try {
+      const ssrData = JSON.parse(ssrMatch[1]);
+      const domainData = ssrData?.reduxInitialState?.domainData;
+
+      // Look for bulletin/listing data in various places
+      const possibleSources = [
+        domainData?.searchResults,
+        domainData?.bulletins,
+        domainData?.marketplaceBulletins,
+      ];
+
+      for (const source of possibleSources) {
+        if (source?.data && Array.isArray(source.data)) {
+          for (const item of source.data) {
+            const listing = parseMadlanItem(item);
+            if (listing) listings.push(listing);
+          }
+        }
+      }
+    } catch (e) {
+      console.error("[Madlan] Failed to parse SSR context:", e);
+    }
+  }
+
+  // Also try parsing visible HTML elements with cheerio
+  if (listings.length === 0) {
+    const $ = cheerio.load(html);
+
+    // Look for any structured data (JSON-LD)
+    $('script[type="application/ld+json"]').each((_, el) => {
+      try {
+        const data = JSON.parse($(el).html() || "");
+        if (data["@type"] === "ItemList" && data.itemListElement) {
+          for (const item of data.itemListElement) {
+            const listing = parseMadlanJsonLd(item);
+            if (listing) listings.push(listing);
+          }
+        }
+      } catch {}
+    });
+  }
+
+  console.log(`[Madlan] Parsed ${listings.length} listings`);
+  return listings;
+}
+
+function parseMadlanItem(item: any): Listing | null {
+  if (!item) return null;
+
+  try {
+    return {
+      id: `madlan_${item.id || item.docId || Date.now()}`,
+      source: "madlan",
+      title: item.address || item.streetName || "",
+      description: item.description || "",
+      price: item.price || 0,
+      rooms: item.rooms || item.beds || 0,
+      sqm: item.area || item.squareMeters || 0,
+      floor: item.floor || 0,
+      area: item.neighbourhood || item.neighborhood || "",
+      address: item.address || "",
+      balcony: Boolean(item.balcony),
+      parking: Boolean(item.parking),
+      mamad: Boolean(item.mamad || item.safeRoom),
+      elevator: Boolean(item.elevator),
+      condition: item.generalCondition || item.condition || "",
+      images: (item.images || []).map((img: any) =>
+        typeof img === "string" ? img : img.imageUrl || img.url || ""
+      ).filter(Boolean),
+      url: item.url
+        ? (item.url.startsWith("http") ? item.url : `https://www.madlan.co.il${item.url}`)
+        : "https://www.madlan.co.il/",
+      agentName: item.contactName,
+      agentPhone: item.contactPhone,
+      postedAt: item.firstTimeSeen || item.dateAdded || new Date().toISOString(),
+      scrapedAt: new Date().toISOString(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseMadlanJsonLd(item: any): Listing | null {
+  if (!item?.item) return null;
+  const data = item.item;
+
+  try {
+    return {
+      id: `madlan_ld_${item.position || Date.now()}`,
+      source: "madlan",
+      title: data.name || "",
+      description: data.description || "",
+      price: parseInt(String(data.offers?.price || "0").replace(/[^\d]/g, "")) || 0,
+      rooms: 0,
+      sqm: 0,
+      floor: 0,
+      area: "",
+      address: data.address?.streetAddress || "",
+      balcony: false,
+      parking: false,
+      mamad: false,
+      elevator: false,
+      condition: "",
+      images: data.image ? [data.image] : [],
+      url: data.url || "https://www.madlan.co.il/",
+      postedAt: new Date().toISOString(),
+      scrapedAt: new Date().toISOString(),
+    };
+  } catch {
+    return null;
   }
 }

@@ -1,178 +1,194 @@
 import * as cheerio from "cheerio";
 import { Listing, SearchPreferences } from "../types";
 
-const YAD2_API_BASE = "https://gw.yad2.co.il/feed-search-legacy/realestate/rent";
+/**
+ * Yad2 scraper - parses __NEXT_DATA__ from the SSR HTML page.
+ * The feed data is inside dehydratedState.queries with key "realestate-rent-feed".
+ */
 
-function buildYad2Params(prefs: SearchPreferences): URLSearchParams {
+// Known tag IDs from Yad2
+const TAG_IDS = {
+  MAMAD: 1009,
+  PARKING: 1003,
+  NEW_FROM_CONTRACTOR: 1000,
+  BALCONY: 1011,
+  ELEVATOR: 1014,
+  AIR_CONDITIONING: 1004,
+  RENOVATED: 1002,
+  FURNISHED: 1012,
+  ACCESSIBLE: 1015,
+  PETS_ALLOWED: 1013,
+  BARS: 1006,
+  STORAGE: 1005,
+  TERRACE: 1016,
+};
+
+function buildYad2Url(prefs: SearchPreferences): string {
   const params = new URLSearchParams();
-  // Tel Aviv area code
   params.set("city", "5000");
-  params.set("topArea", "2"); // Tel Aviv area
-  params.set("area", "1"); // Tel Aviv city
+  params.set("area", "1");
 
-  if (prefs.minRooms) params.set("rooms", `${prefs.minRooms}-${prefs.maxRooms}`);
-  if (prefs.minPrice) params.set("price", `${prefs.minPrice}-${prefs.maxPrice}`);
-  if (prefs.minSqm) params.set("squaremeter", `${prefs.minSqm}-${prefs.maxSqm}`);
-  if (prefs.balcony) params.set("balcony", "1");
-  if (prefs.parking) params.set("parking", "1");
-  if (prefs.mamad) params.set("roomsnum", "1"); // mamad filter
-  if (prefs.elevator) params.set("elevator", "1");
-  if (prefs.penthouse) params.set("propertyGroup", "apartments");
+  if (prefs.minRooms) params.set("minRooms", String(prefs.minRooms));
+  if (prefs.maxRooms) params.set("maxRooms", String(prefs.maxRooms));
+  if (prefs.minPrice) params.set("minPrice", String(prefs.minPrice));
+  if (prefs.maxPrice) params.set("maxPrice", String(prefs.maxPrice));
+  if (prefs.minSqm) params.set("minSquaremeter", String(prefs.minSqm));
+  if (prefs.maxSqm) params.set("maxSquaremeter", String(prefs.maxSqm));
 
-  // property types: 1=apartment, 3=penthouse, 49=duplex
-  const types = ["1"];
-  if (prefs.penthouse) types.push("3");
-  params.set("property", types.join(","));
+  // Property types: apartment=1, penthouse=3, garden-apartment=4, duplex=49
+  if (prefs.penthouse) {
+    params.set("property", "1,3");
+  }
 
-  return params;
+  return `https://www.yad2.co.il/realestate/rent?${params.toString()}`;
 }
 
 export async function searchYad2(prefs: SearchPreferences): Promise<Listing[]> {
-  const params = buildYad2Params(prefs);
-  const url = `${YAD2_API_BASE}?${params.toString()}`;
+  const url = buildYad2Url(prefs);
+  console.log("[Yad2] Fetching:", url);
 
   try {
     const response = await fetch(url, {
       headers: {
         "User-Agent":
           "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept: "application/json",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
-        Referer: "https://www.yad2.co.il/",
-        Origin: "https://www.yad2.co.il",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "no-cache",
+        Pragma: "no-cache",
       },
-      next: { revalidate: 0 },
     });
 
     if (!response.ok) {
-      console.error(`Yad2 API error: ${response.status}`);
-      return await scrapeYad2Html(prefs);
+      console.error(`[Yad2] HTTP ${response.status}`);
+      return [];
     }
-
-    const data = await response.json();
-    return parseYad2ApiResponse(data);
-  } catch (error) {
-    console.error("Yad2 API failed, falling back to HTML scraping:", error);
-    return await scrapeYad2Html(prefs);
-  }
-}
-
-function parseYad2ApiResponse(data: any): Listing[] {
-  const listings: Listing[] = [];
-  const items = data?.data?.feed?.feed_items || data?.feed_items || [];
-
-  for (const item of items) {
-    if (item.type === "ad" || item.type === "item") {
-      try {
-        const listing: Listing = {
-          id: `yad2_${item.id || item.token}`,
-          source: "yad2",
-          title: item.title_1 || item.row_1 || "",
-          description: item.title_2 || item.row_2 || "",
-          price: parsePrice(item.price || item.row_3 || ""),
-          rooms: parseFloat(item.rooms_text || item.Rooms_text || "0"),
-          sqm: parseInt(item.square_meters || item.SquareMeter_text || "0"),
-          floor: parseInt(item.floor_text || item.Floor_text || "0"),
-          area: item.neighborhood || item.area_text || "",
-          address: [item.street, item.house_number, item.city]
-            .filter(Boolean)
-            .join(" "),
-          balcony: Boolean(item.balcony || item.Balcony_text),
-          parking: Boolean(item.parking || item.Parking_text),
-          mamad: Boolean(item.saferoom || item.SafeRoom_text),
-          elevator: Boolean(item.elevator || item.Elevator_text),
-          condition: item.AssetClassificationID_text || item.info_bar_items?.[0] || "",
-          images: extractYad2Images(item),
-          url: `https://www.yad2.co.il/item/${item.id || item.token}`,
-          postedAt: item.date || item.DateAdded || new Date().toISOString(),
-          scrapedAt: new Date().toISOString(),
-        };
-
-        if (item.contact_name) listing.agentName = item.contact_name;
-        if (item.contact_phone) listing.agentPhone = item.contact_phone;
-
-        listings.push(listing);
-      } catch (e) {
-        console.error("Failed to parse Yad2 item:", e);
-      }
-    }
-  }
-
-  return listings;
-}
-
-async function scrapeYad2Html(prefs: SearchPreferences): Promise<Listing[]> {
-  const params = buildYad2Params(prefs);
-  const url = `https://www.yad2.co.il/realestate/rent?${params.toString()}`;
-
-  try {
-    const response = await fetch(url, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
-        "Accept-Language": "he-IL,he;q=0.9",
-      },
-    });
 
     const html = await response.text();
-    const $ = cheerio.load(html);
-    const listings: Listing[] = [];
-
-    $("[data-testid='feed-item'], .feeditem, .feed_item").each((_, el) => {
-      try {
-        const $el = $(el);
-        const id = $el.attr("data-id") || $el.attr("item-id") || `yad2_html_${Date.now()}_${_}`;
-        const title = $el.find(".title, [class*='title']").first().text().trim();
-        const priceText = $el.find(".price, [class*='price']").first().text().trim();
-        const address = $el.find(".subtitle, [class*='address']").first().text().trim();
-        const rooms = $el.find("[class*='rooms']").text().trim();
-        const sqm = $el.find("[class*='square']").text().trim();
-        const floor = $el.find("[class*='floor']").text().trim();
-        const link = $el.find("a").first().attr("href") || "";
-
-        listings.push({
-          id: `yad2_${id}`,
-          source: "yad2",
-          title: title || address,
-          description: "",
-          price: parsePrice(priceText),
-          rooms: parseFloat(rooms) || 0,
-          sqm: parseInt(sqm) || 0,
-          floor: parseInt(floor) || 0,
-          area: "",
-          address,
-          balcony: false,
-          parking: false,
-          mamad: false,
-          elevator: false,
-          condition: "",
-          images: [],
-          url: link.startsWith("http") ? link : `https://www.yad2.co.il${link}`,
-          postedAt: new Date().toISOString(),
-          scrapedAt: new Date().toISOString(),
-        });
-      } catch {}
-    });
-
-    return listings;
+    return parseYad2Html(html, prefs);
   } catch (error) {
-    console.error("Yad2 HTML scrape failed:", error);
+    console.error("[Yad2] Fetch failed:", error);
     return [];
   }
 }
 
-function parsePrice(text: string): number {
-  const cleaned = text.replace(/[^\d]/g, "");
-  return parseInt(cleaned) || 0;
+function parseYad2Html(html: string, prefs: SearchPreferences): Listing[] {
+  const $ = cheerio.load(html);
+  const nextDataScript = $("#__NEXT_DATA__").html();
+
+  if (!nextDataScript) {
+    console.error("[Yad2] No __NEXT_DATA__ found in HTML");
+    return [];
+  }
+
+  let nextData: any;
+  try {
+    nextData = JSON.parse(nextDataScript);
+  } catch (e) {
+    console.error("[Yad2] Failed to parse __NEXT_DATA__ JSON:", e);
+    return [];
+  }
+
+  const queries = nextData?.props?.pageProps?.dehydratedState?.queries || [];
+
+  // Find the feed query - its key contains "realestate-rent-feed"
+  const feedQuery = queries.find((q: any) => {
+    const keyStr = JSON.stringify(q.queryKey || "");
+    return keyStr.includes("realestate-rent-feed") || keyStr.includes("rent-feed");
+  });
+
+  if (!feedQuery) {
+    console.error("[Yad2] Feed query not found. Available queries:",
+      queries.map((q: any) => JSON.stringify(q.queryKey).substring(0, 80)));
+    return [];
+  }
+
+  const feedData = feedQuery.state?.data;
+  if (!feedData) {
+    console.error("[Yad2] No feed data in query");
+    return [];
+  }
+
+  const listings: Listing[] = [];
+
+  // Collect items from all feed categories
+  const categories = ["private", "agency", "yad1", "platinum", "kingOfTheHar", "trio", "booster", "leadingBroker"];
+  for (const category of categories) {
+    const items = feedData[category] || [];
+    for (const item of items) {
+      try {
+        const listing = parseYad2Item(item, prefs);
+        if (listing) listings.push(listing);
+      } catch (e) {
+        console.error("[Yad2] Failed to parse item:", e);
+      }
+    }
+  }
+
+  console.log(`[Yad2] Parsed ${listings.length} listings from ${categories.length} categories`);
+  return listings;
 }
 
-function extractYad2Images(item: any): string[] {
-  if (item.images) {
-    return item.images.map((img: any) =>
-      typeof img === "string" ? img : img.src || img.url || "",
-    ).filter(Boolean);
-  }
-  if (item.img_url) return [item.img_url];
-  if (item.image) return [item.image];
-  return [];
+function parseYad2Item(item: any, prefs: SearchPreferences): Listing | null {
+  const token = item.token;
+  if (!token) return null;
+
+  const address = item.address || {};
+  const details = item.additionalDetails || {};
+  const meta = item.metaData || {};
+  const tags = item.tags || [];
+
+  const tagIds = new Set(tags.map((t: any) => t.id));
+  const tagNames = tags.map((t: any) => t.name);
+
+  const hasBalcony = tagIds.has(TAG_IDS.BALCONY) || tagIds.has(TAG_IDS.TERRACE);
+  const hasParking = tagIds.has(TAG_IDS.PARKING);
+  const hasMamad = tagIds.has(TAG_IDS.MAMAD);
+  const hasElevator = tagIds.has(TAG_IDS.ELEVATOR);
+
+  // Build address string
+  const street = address.street?.text || "";
+  const houseNum = address.house?.number || "";
+  const neighborhood = address.neighborhood?.text || "";
+  const city = address.city?.text || "תל אביב יפו";
+  const fullAddress = [street, houseNum, neighborhood, city].filter(Boolean).join(", ");
+
+  // Condition mapping
+  const conditionId = details.propertyCondition?.id;
+  let condition = "";
+  if (conditionId === 1) condition = "חדש מקבלן";
+  else if (conditionId === 2) condition = "חדש";
+  else if (conditionId === 3) condition = "משופץ";
+  else if (conditionId === 4) condition = "במצב שמור";
+  else if (conditionId === 5) condition = "דרוש שיפוץ";
+
+  const listing: Listing = {
+    id: `yad2_${token}`,
+    source: "yad2",
+    title: `${details.property?.text || "דירה"} - ${street || neighborhood}`,
+    description: tagNames.join(", "),
+    price: item.price || 0,
+    rooms: details.roomsCount || 0,
+    sqm: details.squareMeter || 0,
+    floor: address.house?.floor || 0,
+    area: neighborhood,
+    address: fullAddress,
+    balcony: hasBalcony,
+    parking: hasParking,
+    mamad: hasMamad,
+    elevator: hasElevator,
+    condition,
+    images: meta.images || (meta.coverImage ? [meta.coverImage] : []),
+    url: `https://www.yad2.co.il/item/${token}`,
+    postedAt: item.date || new Date().toISOString(),
+    scrapedAt: new Date().toISOString(),
+  };
+
+  // Optional contact info
+  if (item.contactName) listing.agentName = item.contactName;
+  if (item.contactPhone) listing.agentPhone = item.contactPhone;
+
+  return listing;
 }
