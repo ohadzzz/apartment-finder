@@ -7,6 +7,8 @@ import { searchFacebook } from "@/lib/scrapers/facebook";
 import { searchAgentListings } from "@/lib/scrapers/agents";
 import { rankListings } from "@/lib/matcher";
 
+export const maxDuration = 60; // Allow up to 60s for scraping
+
 export async function POST(request: NextRequest) {
   if (!verifyAuth(request)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -14,6 +16,8 @@ export async function POST(request: NextRequest) {
 
   const config = await getConfig();
   const prefs = config.preferences;
+
+  const hasScrapingKey = !!process.env.SCRAPING_API_KEY;
 
   // Search all sources in parallel
   const [yad2Results, madlanResults, fbResults, agentResults] =
@@ -23,6 +27,10 @@ export async function POST(request: NextRequest) {
       searchFacebook(prefs),
       searchAgentListings(prefs),
     ]);
+
+  const errors: string[] = [];
+  if (yad2Results.status === "rejected") errors.push(`Yad2: ${yad2Results.reason}`);
+  if (madlanResults.status === "rejected") errors.push(`Madlan: ${madlanResults.reason}`);
 
   const allResults = [
     ...(yad2Results.status === "fulfilled" ? yad2Results.value : []),
@@ -41,6 +49,8 @@ export async function POST(request: NextRequest) {
   return NextResponse.json({
     newCount: newListings.length,
     totalCount: allListings.length,
+    hasScrapingKey,
+    errors: errors.length > 0 ? errors : undefined,
     sources: {
       yad2: yad2Results.status === "fulfilled" ? yad2Results.value.length : 0,
       madlan: madlanResults.status === "fulfilled" ? madlanResults.value.length : 0,

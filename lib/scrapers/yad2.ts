@@ -2,8 +2,10 @@ import * as cheerio from "cheerio";
 import { Listing, SearchPreferences } from "../types";
 
 /**
- * Yad2 scraper - parses __NEXT_DATA__ from the SSR HTML page.
- * The feed data is inside dehydratedState.queries with key "realestate-rent-feed".
+ * Yad2 scraper - uses ScrapingBee or similar proxy to bypass ShieldSquare/PerimeterX,
+ * then parses __NEXT_DATA__ from the SSR HTML page.
+ *
+ * If no SCRAPING_API_KEY is set, falls back to direct fetch (may not work from servers).
  */
 
 // Known tag IDs from Yad2
@@ -35,7 +37,6 @@ function buildYad2Url(prefs: SearchPreferences): string {
   if (prefs.minSqm) params.set("minSquaremeter", String(prefs.minSqm));
   if (prefs.maxSqm) params.set("maxSquaremeter", String(prefs.maxSqm));
 
-  // Property types: apartment=1, penthouse=3, garden-apartment=4, duplex=49
   if (prefs.penthouse) {
     params.set("property", "1,3");
   }
@@ -43,33 +44,70 @@ function buildYad2Url(prefs: SearchPreferences): string {
   return `https://www.yad2.co.il/realestate/rent?${params.toString()}`;
 }
 
-export async function searchYad2(prefs: SearchPreferences): Promise<Listing[]> {
-  const url = buildYad2Url(prefs);
-  console.log("[Yad2] Fetching:", url);
+async function fetchWithProxy(url: string): Promise<string> {
+  const apiKey = process.env.SCRAPING_API_KEY;
+  const apiProvider = process.env.SCRAPING_PROVIDER || "scrapingbee"; // scrapingbee | zenrows | scraperapi
 
-  try {
-    const response = await fetch(url, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Cache-Control": "no-cache",
-        Pragma: "no-cache",
-      },
-    });
+  if (apiKey) {
+    let proxyUrl: string;
 
-    if (!response.ok) {
-      console.error(`[Yad2] HTTP ${response.status}`);
-      return [];
+    switch (apiProvider) {
+      case "zenrows":
+        proxyUrl = `https://api.zenrows.com/v1/?apikey=${apiKey}&url=${encodeURIComponent(url)}&js_render=true&premium_proxy=true`;
+        break;
+      case "scraperapi":
+        proxyUrl = `http://api.scraperapi.com/?api_key=${apiKey}&url=${encodeURIComponent(url)}&render=true&country_code=il`;
+        break;
+      case "scrapingbee":
+      default:
+        proxyUrl = `https://app.scrapingbee.com/api/v1/?api_key=${apiKey}&url=${encodeURIComponent(url)}&render_js=true&premium_proxy=true&country_code=il`;
+        break;
     }
 
-    const html = await response.text();
+    console.log(`[Yad2] Using ${apiProvider} proxy`);
+    const response = await fetch(proxyUrl, { signal: AbortSignal.timeout(45000) });
+
+    if (!response.ok) {
+      console.error(`[Yad2] Proxy returned ${response.status}`);
+      throw new Error(`Proxy error: ${response.status}`);
+    }
+
+    return response.text();
+  }
+
+  // Direct fetch fallback (won't work from most servers due to bot protection)
+  console.log("[Yad2] No SCRAPING_API_KEY set, trying direct fetch (may be blocked)");
+  const response = await fetch(url, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+    },
+    redirect: "follow",
+    signal: AbortSignal.timeout(15000),
+  });
+
+  const html = await response.text();
+
+  // Check if we got a captcha page
+  if (html.includes("ShieldSquare") || html.includes("perfdrive.com") || html.includes("carta.radware.com")) {
+    console.error("[Yad2] Bot protection detected. Set SCRAPING_API_KEY env var to use a scraping proxy.");
+    throw new Error("Bot protection - need scraping proxy");
+  }
+
+  return html;
+}
+
+export async function searchYad2(prefs: SearchPreferences): Promise<Listing[]> {
+  const url = buildYad2Url(prefs);
+  console.log("[Yad2] Target URL:", url);
+
+  try {
+    const html = await fetchWithProxy(url);
     return parseYad2Html(html, prefs);
   } catch (error) {
-    console.error("[Yad2] Fetch failed:", error);
+    console.error("[Yad2] Failed:", error);
     return [];
   }
 }
@@ -79,7 +117,7 @@ function parseYad2Html(html: string, prefs: SearchPreferences): Listing[] {
   const nextDataScript = $("#__NEXT_DATA__").html();
 
   if (!nextDataScript) {
-    console.error("[Yad2] No __NEXT_DATA__ found in HTML");
+    console.error("[Yad2] No __NEXT_DATA__ found in HTML. HTML preview:", html.substring(0, 500));
     return [];
   }
 
@@ -93,7 +131,7 @@ function parseYad2Html(html: string, prefs: SearchPreferences): Listing[] {
 
   const queries = nextData?.props?.pageProps?.dehydratedState?.queries || [];
 
-  // Find the feed query - its key contains "realestate-rent-feed"
+  // Find the feed query
   const feedQuery = queries.find((q: any) => {
     const keyStr = JSON.stringify(q.queryKey || "");
     return keyStr.includes("realestate-rent-feed") || keyStr.includes("rent-feed");
@@ -113,7 +151,6 @@ function parseYad2Html(html: string, prefs: SearchPreferences): Listing[] {
 
   const listings: Listing[] = [];
 
-  // Collect items from all feed categories
   const categories = ["private", "agency", "yad1", "platinum", "kingOfTheHar", "trio", "booster", "leadingBroker"];
   for (const category of categories) {
     const items = feedData[category] || [];
@@ -127,11 +164,11 @@ function parseYad2Html(html: string, prefs: SearchPreferences): Listing[] {
     }
   }
 
-  console.log(`[Yad2] Parsed ${listings.length} listings from ${categories.length} categories`);
+  console.log(`[Yad2] Parsed ${listings.length} listings`);
   return listings;
 }
 
-function parseYad2Item(item: any, prefs: SearchPreferences): Listing | null {
+function parseYad2Item(item: any, _prefs: SearchPreferences): Listing | null {
   const token = item.token;
   if (!token) return null;
 
@@ -141,21 +178,18 @@ function parseYad2Item(item: any, prefs: SearchPreferences): Listing | null {
   const tags = item.tags || [];
 
   const tagIds = new Set(tags.map((t: any) => t.id));
-  const tagNames = tags.map((t: any) => t.name);
 
   const hasBalcony = tagIds.has(TAG_IDS.BALCONY) || tagIds.has(TAG_IDS.TERRACE);
   const hasParking = tagIds.has(TAG_IDS.PARKING);
   const hasMamad = tagIds.has(TAG_IDS.MAMAD);
   const hasElevator = tagIds.has(TAG_IDS.ELEVATOR);
 
-  // Build address string
   const street = address.street?.text || "";
   const houseNum = address.house?.number || "";
   const neighborhood = address.neighborhood?.text || "";
   const city = address.city?.text || "תל אביב יפו";
   const fullAddress = [street, houseNum, neighborhood, city].filter(Boolean).join(", ");
 
-  // Condition mapping
   const conditionId = details.propertyCondition?.id;
   let condition = "";
   if (conditionId === 1) condition = "חדש מקבלן";
@@ -168,7 +202,7 @@ function parseYad2Item(item: any, prefs: SearchPreferences): Listing | null {
     id: `yad2_${token}`,
     source: "yad2",
     title: `${details.property?.text || "דירה"} - ${street || neighborhood}`,
-    description: tagNames.join(", "),
+    description: tags.map((t: any) => t.name).join(", "),
     price: item.price || 0,
     rooms: details.roomsCount || 0,
     sqm: details.squareMeter || 0,
@@ -186,7 +220,6 @@ function parseYad2Item(item: any, prefs: SearchPreferences): Listing | null {
     scrapedAt: new Date().toISOString(),
   };
 
-  // Optional contact info
   if (item.contactName) listing.agentName = item.contactName;
   if (item.contactPhone) listing.agentPhone = item.contactPhone;
 
